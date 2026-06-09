@@ -1,4 +1,4 @@
-import { useState, useRef } from "react";
+import { useState, useRef, useEffect } from "react";
 
 // ─── API ENDPOINT ────────────────────────────────────────────────────────────
 // All AI calls route through /api/claude (Vercel serverless proxy).
@@ -343,31 +343,136 @@ function HoursEstimator({jobType,jobDesc,matFields,hours,setHours,crewSize,setCr
   const hpw=crewSize>0?round(totalH/crewSize):totalH;
   const days=(hpw/8).toFixed(1);
 
-  // Auto-populate from defaults when job type changes
-  useState(()=>{
-    if(jobType && !userEdited && !hours) {
-      const def = HOUR_DEFAULTS[jobType];
-      if(def) {
-        const sqft = Number(matFields?.sqft||0);
-        // Scale hours by sqft if available
-        let mid = def.mid;
-        if(sqft > 0 && def.rate.includes("sq ft")) {
-          const rateMatch = def.rate.match(/(\d+)/);
-          if(rateMatch) {
-            const sqftPerHr = Number(rateMatch[1]);
-            mid = Math.max(def.low, Math.min(def.high, Math.round((sqft / sqftPerHr) * 2) / 2));
-          }
-        }
-        setEst({
-          totalManHoursLow:def.low, totalManHoursHigh:def.high, totalManHoursMid:mid,
-          productivityRate:def.rate, prepTime:def.prep, workTime:def.work,
-          cleanupTime:def.cleanup, driveTime:def.drive,
-          historicalNote:"Based on industry standard RSMeans / Craftsman labor productivity rates for Central KY."
-        });
-        setHours(String(mid));
+  // Recalculate hours every time jobType or any spec field changes
+  function calcDefaultHours() {
+    if(!jobType) return null;
+    const def = HOUR_DEFAULTS[jobType];
+    if(!def) return null;
+
+    const sqft = Number(matFields?.sqft || 0);
+    const coats = Number(matFields?.coats || 1);
+    const rooms = Number(matFields?.rooms || 1);
+    const holes = Number(matFields?.holes || 1);
+    const fixtures = Number(matFields?.fixture_count || 1);
+    const linearFt = Number(matFields?.linear_ft || 0);
+    const doorCount = Number(matFields?.door_count || 0);
+    const condition = matFields?.condition || "";
+    const removal = matFields?.removal || "No";
+    const access = matFields?.access || "Easy – ground level";
+
+    let mid = def.mid;
+    let low = def.low;
+    let high = def.high;
+    let prepTime = def.prep;
+    let workTime = def.work;
+
+    // Scale by square footage when available
+    if(sqft > 0) {
+      const rateMatch = def.rate.match(/(\d+)/);
+      if(rateMatch && def.rate.includes("sq ft")) {
+        const sqftPerHr = Number(rateMatch[1]);
+        const baseWork = sqft / sqftPerHr;
+        // Multiply by coats for painting
+        const coatMultiplier = coats > 1 ? 1 + (coats - 1) * 0.6 : 1;
+        workTime = Math.round(baseWork * coatMultiplier * 2) / 2;
+        mid = workTime + def.prep + def.cleanup + def.drive;
+        low = Math.round(mid * 0.75 * 2) / 2;
+        high = Math.round(mid * 1.4 * 2) / 2;
+        prepTime = def.prep;
       }
     }
-  },[jobType]);
+
+    // Scale by room count
+    if(rooms > 1 && sqft === 0) {
+      mid = def.mid * rooms;
+      low = def.low * rooms;
+      high = def.high * rooms;
+      workTime = def.work * rooms;
+    }
+
+    // Scale by hole/damage count for drywall
+    if(holes > 1 && sqft === 0) {
+      mid = Math.max(def.mid, holes * 0.75);
+      low = Math.max(def.low, holes * 0.5);
+      high = Math.max(def.high, holes * 1.25);
+    }
+
+    // Scale by fixture count for plumbing
+    if(fixtures > 1 && sqft === 0) {
+      mid = def.mid * fixtures;
+      low = def.low * fixtures;
+      high = def.high * fixtures;
+    }
+
+    // Scale by linear feet for carpentry
+    if(linearFt > 0 && sqft === 0) {
+      const rateMatch = def.rate.match(/(\d+)/);
+      if(rateMatch && def.rate.includes("ln ft")) {
+        const lfPerHr = Number(rateMatch[1]);
+        workTime = Math.round((linearFt / lfPerHr) * 2) / 2;
+        mid = workTime + def.prep + def.cleanup + def.drive;
+        low = Math.round(mid * 0.75 * 2) / 2;
+        high = Math.round(mid * 1.4 * 2) / 2;
+      }
+    }
+
+    // Scale by door/window count
+    if(doorCount > 1 && sqft === 0 && linearFt === 0) {
+      mid = def.mid * doorCount;
+      low = def.low * doorCount;
+      high = def.high * doorCount;
+    }
+
+    // Condition modifiers
+    if(condition.includes("Poor") || condition.includes("heavy")) {
+      mid = Math.round(mid * 1.4 * 2) / 2;
+      high = Math.round(high * 1.5 * 2) / 2;
+      prepTime = Math.round(prepTime * 2 * 2) / 2;
+    } else if(condition.includes("Fair") || condition.includes("moderate")) {
+      mid = Math.round(mid * 1.2 * 2) / 2;
+      prepTime = Math.round(prepTime * 1.5 * 2) / 2;
+    }
+
+    // Floor removal adds time
+    if(removal.includes("complex")) { mid += 4; high += 6; }
+    else if(removal.includes("Yes")) { mid += 2; high += 3; }
+
+    // Access difficulty
+    if(access.includes("Difficult")) { mid = Math.round(mid * 1.3 * 2) / 2; high = Math.round(high * 1.4 * 2) / 2; }
+    else if(access.includes("Moderate")) { mid = Math.round(mid * 1.15 * 2) / 2; }
+
+    // Crew size suggestion based on hours
+    const suggestedCrew = mid > 16 ? 2 : mid > 32 ? 3 : 1;
+
+    return {
+      totalManHoursLow: Math.max(0.5, Math.round(low * 2) / 2),
+      totalManHoursHigh: Math.max(1, Math.round(high * 2) / 2),
+      totalManHoursMid: Math.max(0.5, Math.round(mid * 2) / 2),
+      productivityRate: def.rate,
+      prepTime: Math.max(0.5, Math.round(prepTime * 2) / 2),
+      workTime: Math.max(0.5, Math.round(workTime * 2) / 2),
+      cleanupTime: def.cleanup,
+      driveTime: def.drive,
+      suggestedCrew,
+      historicalNote: "Calculated from RSMeans/Craftsman industry rates, scaled to your job specs. Edit freely."
+    };
+  }
+
+  // Re-calculate whenever jobType or any spec field changes
+  useEffect(() => {
+    if(!jobType) return;
+    const calculated = calcDefaultHours();
+    if(calculated) {
+      setEst(calculated);
+      if(!userEdited) {
+        setHours(String(calculated.totalManHoursMid));
+        if(calculated.suggestedCrew) setCrewSize(calculated.suggestedCrew);
+      }
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [jobType, matFields?.sqft, matFields?.coats, matFields?.rooms, matFields?.holes,
+      matFields?.fixture_count, matFields?.linear_ft, matFields?.door_count,
+      matFields?.condition, matFields?.removal, matFields?.access]);
 
   async function getAIEstimate() {
     setLoading(true);
