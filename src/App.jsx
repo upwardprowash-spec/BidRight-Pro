@@ -98,9 +98,38 @@ function round(n,step=0.5){return Math.round(n/step)*step;}
 async function callClaude(messages, system, useSearch=false) {
   const body = { model:"claude-sonnet-4-20250514", max_tokens:1800, system, messages };
   if (useSearch) body.tools = [{type:"web_search_20250305",name:"web_search"}];
-  const res = await fetch("/api/claude",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
-  const data = await res.json();
-  return data.content?.map(b=>b.text||"").filter(Boolean).join("\n")||"";
+  
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 30000);
+  
+  try {
+    const res = await fetch("/api/claude",{
+      method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body:JSON.stringify(body),
+      signal:controller.signal
+    });
+    clearTimeout(timeout);
+    
+    if (!res.ok) {
+      const errText = await res.text();
+      console.error("API error:", res.status, errText);
+      throw new Error(`API returned ${res.status}`);
+    }
+    
+    const data = await res.json();
+    
+    if (data.error) {
+      console.error("Claude error:", data.error);
+      throw new Error(data.error);
+    }
+    
+    return data.content?.map(b=>b.text||"").filter(Boolean).join("\n")||"";
+  } catch(e) {
+    clearTimeout(timeout);
+    console.error("callClaude failed:", e.message);
+    throw e;
+  }
 }
 
 function parseJSON(text) {
@@ -690,15 +719,60 @@ export default function BidRightPro() {
   async function buildTiers() {
     setLoadingTiers(true);
     try {
-      const text = await callClaude([{role:"user",content:`Build Good/Better/Best pricing packages for: ${jobType}. Job description: ${jobDesc}. Specs: ${JSON.stringify(matFields)}. Base cost to contractor: $${directCost.toFixed(0)}. Market range: ${currency(low)} – ${currency(high)}.\n\nReturn ONLY valid JSON:\n{"good":{"price":"$XXX","features":["f1","f2","f3","f4"]},"better":{"price":"$XXX","features":["f1","f2","f3","f4","f5"]},"best":{"price":"$XXX","features":["f1","f2","f3","f4","f5","f6"]}}`}],
-        "You are a contractor pricing expert. Good = lean scope at competitive price. Better = full service at healthy margin (recommended). Best = premium upgrades/warranty. Return valid JSON only.", true);
-      const p = parseJSON(text);
-      const merged = {};
-      ["good","better","best"].forEach(k=>{
-        merged[k] = {...p[k], featuresText:(p[k]?.features||[]).join("\n")};
+      const goodPrice = Math.round(low);
+      const betterPrice = Math.round(recommended);
+      const bestPrice = Math.round(high);
+      const hints = JOB_CATEGORIES[category]?.tierHints || {};
+
+      const text = await callClaude([{role:"user",content:`You are a contractor pricing expert for handyman services in Central Kentucky.
+
+Build 3 pricing packages for this job:
+Job Type: ${jobType}
+Description: ${jobDesc}
+Contractor cost: $${directCost.toFixed(0)}
+Suggested prices: Good=$${goodPrice}, Better=$${betterPrice}, Best=$${bestPrice}
+
+Return ONLY this exact JSON structure with NO extra text, NO markdown, NO dollar signs in prices:
+{"good":{"price":${goodPrice},"features":["feature 1","feature 2","feature 3","feature 4"]},"better":{"price":${betterPrice},"features":["feature 1","feature 2","feature 3","feature 4","feature 5"]},"best":{"price":${bestPrice},"features":["feature 1","feature 2","feature 3","feature 4","feature 5","feature 6"]}}`}],
+        "You are a contractor pricing expert. Return ONLY valid JSON. No markdown. No dollar signs in price values. Prices must be plain integers.", false);
+
+      // Try to parse, with multiple fallback strategies
+      let p = null;
+      try { p = parseJSON(text); } catch(e1) {
+        // Try extracting just the JSON part
+        const match = text.match(/\{[\s\S]*\}/);
+        if (match) { try { p = JSON.parse(match[0]); } catch(e2) { p = null; } }
+      }
+
+      if (p && p.good && p.better && p.best) {
+        const merged = {};
+        ["good","better","best"].forEach(k=>{
+          // Strip any $ signs from price just in case
+          const rawPrice = String(p[k]?.price||"").replace(/[^0-9.]/g,"");
+          merged[k] = {
+            price: rawPrice || String(k==="good"?goodPrice:k==="better"?betterPrice:bestPrice),
+            features: p[k]?.features||hints[k]||[],
+            featuresText: (p[k]?.features||hints[k]||[]).join("\n")
+          };
+        });
+        setTiers(merged);
+      } else {
+        // Fallback: use calculated prices with hint features
+        setTiers({
+          good:{price:String(goodPrice),features:hints.good||["Basic scope","Standard materials","Area cleanup"],featuresText:(hints.good||["Basic scope"]).join("\n")},
+          better:{price:String(betterPrice),features:hints.better||["Full scope","Premium materials","Full cleanup"],featuresText:(hints.better||["Full scope"]).join("\n")},
+          best:{price:String(bestPrice),features:hints.best||["Premium scope","Top materials","Warranty included"],featuresText:(hints.best||["Premium scope"]).join("\n")}
+        });
+      }
+    } catch(err) {
+      // Always show something useful even on total failure
+      const hints = JOB_CATEGORIES[category]?.tierHints || {};
+      setTiers({
+        good:{price:String(Math.round(low)),features:hints.good||["Basic scope"],featuresText:(hints.good||["Basic scope"]).join("\n")},
+        better:{price:String(Math.round(recommended)),features:hints.better||["Full scope"],featuresText:(hints.better||["Full scope"]).join("\n")},
+        best:{price:String(Math.round(high)),features:hints.best||["Premium scope"],featuresText:(hints.best||["Premium scope"]).join("\n")}
       });
-      setTiers(merged);
-    } catch { setTiers({good:{price:currency(low),features:["Basic scope"],featuresText:"Basic scope"},better:{price:currency(recommended),features:["Full scope"],featuresText:"Full scope"},best:{price:currency(high),features:["Premium scope"],featuresText:"Premium scope"}}); }
+    }
     setLoadingTiers(false);
   }
 
@@ -1074,4 +1148,3 @@ export default function BidRightPro() {
     </div>
   );
 }
-
